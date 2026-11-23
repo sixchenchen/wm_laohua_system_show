@@ -1,0 +1,35 @@
+# ========== ESP-IDF 构建输出（必忽略） ==========
+build/
+managed_components/
+sdkconfig.old
+
+# ========== IDE 文件 ==========
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ========== Python 缓存 ==========
+__pycache__/
+*.pyc
+*.pyo
+
+# ========== 临时/日志文件 ==========
+*.log
+*.tmp
+*.bak
+*.backup
+
+# ========== 操作系统文件 ==========
+.DS_Store
+Thumbs.db
+
+# ========== 编译产物（不入库） ==========
+*.bin
+*.elf
+*.map
+*.o
+*.a
+*.so
+*.d
