@@ -9,7 +9,7 @@
 static const char *TAG = "mqtt_config";
 
 // ========== 默认临时服务器配置（首次注册用） ==========
-#define DEFAULT_BROKER_URI "mqtt://192.168.124.6:1884"
+#define DEFAULT_BROKER_URI "mqtt://192.168.1.8:1884"
 #define DEFAULT_USERNAME "MQTT1"
 #define DEFAULT_PASSWORD "123456"
 
@@ -91,6 +91,27 @@ esp_err_t mqtt_config_load(mqtt_config_t *config)
 
     ESP_LOGI(TAG, "Config loaded: broker=%s, client_id=%s, provisioned=%d", config->broker_uri, config->client_id, config->is_provisioned);
     return ESP_OK;
+}
+
+// ========== 仅加载 NVS 中已保存的配置 ==========
+esp_err_t mqtt_config_load_stored(mqtt_config_t *config)
+{
+    if (config == NULL)
+        return ESP_ERR_INVALID_ARG;
+
+    memset(config, 0, sizeof(mqtt_config_t));
+
+    size_t len = sizeof(config->broker_uri);
+    esp_err_t ret = nvs_utils_load_str(MQTT_CONFIG_NAMESPACE, MQTT_KEY_BROKER_URI,
+                                       config->broker_uri, &len);
+    if (ret != ESP_OK || config->broker_uri[0] == '\0')
+    {
+        ESP_LOGI(TAG, "No stored broker config");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    // broker_uri 已存在，mqtt_config_load 不会再用默认值覆盖它
+    return mqtt_config_load(config);
 }
 
 // ========== 保存配置到NVS中 ==========

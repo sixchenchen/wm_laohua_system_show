@@ -2,6 +2,7 @@
 #define MQTT_MANAGER_H
 
 #include "esp_err.h"
+#include "mqtt_config.h"
 #include <stdbool.h>
 
 // MQTT 状态枚举
@@ -22,6 +23,8 @@ typedef void (*mqtt_status_callback_t)(mqtt_state_t state);
 
 // 生命周期管理
 esp_err_t mqtt_manager_init(void);
+esp_err_t mqtt_manager_init_with_config(const mqtt_config_t *config);
+esp_err_t mqtt_manager_reconfigure(const mqtt_config_t *config);
 esp_err_t mqtt_manager_start(void);
 esp_err_t mqtt_manager_stop(void);
 esp_err_t mqtt_manager_destroy(void);

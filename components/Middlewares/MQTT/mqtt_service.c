@@ -377,7 +377,7 @@ static void mqtt_status_callback(mqtt_state_t state)
     {
     case MQTT_STATE_RUNNING:
         ESP_LOGI(TAG, "MQTT 已连接");
-        if (mqtt_config_is_provisioned())
+        if (mqtt_manager_is_production())
         {
             mqtt_publish_status(true);
             mqtt_publish_mos_state();
@@ -385,7 +385,8 @@ static void mqtt_status_callback(mqtt_state_t state)
         }
         else
         {
-            ESP_LOGI(TAG, "Provisioning stage, skip business messages");
+            ESP_LOGI(TAG, "未注册，启动注册流程");
+            mqtt_provision_start();
         }
         break;
 
@@ -500,17 +501,32 @@ void mqtt_service_publish_mos_event(uint8_t channel, uint8_t state)
 }
 
 /*
-    服务初始化
+    使用指定配置初始化
 */
-void mqtt_service_init(void)
+void mqtt_service_init_with_config(const mqtt_config_t *config)
 {
-    esp_err_t ret = mqtt_manager_init();
+    esp_err_t ret = mqtt_manager_reconfigure(config);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "MQTT 初始化失败");
+        ESP_LOGE(TAG, "MQTT 初始化失败: %d", ret);
         return;
     }
     mqtt_manager_register_callback(mqtt_control_callback);
     mqtt_manager_register_status_callback(mqtt_status_callback);
     ESP_LOGI(TAG, "MQTT Service 初始化完成");
+}
+
+/*
+    服务初始化（使用 NVS 配置，缺失时使用默认值）
+*/
+void mqtt_service_init(void)
+{
+    mqtt_config_t config;
+    esp_err_t ret = mqtt_config_load(&config);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "MQTT 配置加载失败: %d", ret);
+        return;
+    }
+    mqtt_service_init_with_config(&config);
 }

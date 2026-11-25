@@ -22,6 +22,7 @@ static mqtt_rx_callback_t rx_callback = NULL;
 static mqtt_status_callback_t status_callback = NULL;
 static char *will_message = NULL;
 static bool s_is_provisioned = false;
+static mqtt_config_t s_active_config;
 
 // MQTT 状态
 static mqtt_state_t mqtt_state = MQTT_STATE_UNINIT;
@@ -64,16 +65,50 @@ static void mqtt_set_state(mqtt_state_t new_state)
     }
 }
 
+// 默认配置（未注册）连接成功后，将实际连接参数写回 NVS
+static void save_default_config_if_needed(void)
+{
+    if (s_is_provisioned)
+    {
+        return;
+    }
+
+    mqtt_config_t stored;
+    if (mqtt_config_load_stored(&stored) == ESP_OK &&
+        strcmp(stored.broker_uri, s_active_config.broker_uri) == 0 &&
+        strcmp(stored.client_id, s_active_config.client_id) == 0 &&
+        strcmp(stored.username, s_active_config.username) == 0)
+    {
+        return;
+    }
+
+    mqtt_config_t config = s_active_config;
+    config.is_provisioned = false;
+    if (mqtt_config_save(&config) == ESP_OK)
+    {
+        ESP_LOGI(TAG, "默认配置连接成功，已写入 NVS: broker=%s", config.broker_uri);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "默认配置写入 NVS 失败");
+    }
+}
+
 //  MQTT事件处理
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
     switch (event_id)
     {
+    case MQTT_EVENT_BEFORE_CONNECT:
+        ESP_LOGI(TAG, "MQTT 正在连接: broker=%s, client_id=%s",
+                 s_active_config.broker_uri, s_active_config.client_id);
+        break;
+
     case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, " MQTT 连接成功");
+        ESP_LOGI(TAG, "MQTT 连接成功: broker=%s, session_present=%d",
+                 s_active_config.broker_uri, event->session_present);
         wifi_manager_set_mqtt_ready(true);
-        mqtt_set_state(MQTT_STATE_RUNNING);
 
         if (s_is_provisioned)
         {
@@ -85,10 +120,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         }
         // provision config response 始终订阅（正式阶段也可能收到 config 更新）
         mqtt_manager_subscribe(mqtt_topic_provision_config(), 1);
+
+        // 使用默认配置连接成功后，把当前连接参数写回 NVS，避免下次启动继续尝试旧地址
+        save_default_config_if_needed();
+
+        // 订阅完成后再置为 RUNNING，确保状态回调里启动注册时订阅已就绪
+        mqtt_set_state(MQTT_STATE_RUNNING);
         break;
 
     case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "MQTT 断开");
+        ESP_LOGW(TAG, "MQTT 断开: broker=%s", s_active_config.broker_uri);
         // 状态由 WiFi 驱动改变
         break;
 
@@ -107,7 +148,22 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 
     case MQTT_EVENT_ERROR:
-        ESP_LOGE(TAG, "MQTT 错误");
+        if (event->error_handle != NULL)
+        {
+            ESP_LOGE(TAG, "MQTT 错误: broker=%s, type=%d, tls_last_err=0x%x, "
+                          "tls_stack_err=0x%x, cert_flags=0x%x, sock_errno=%d, connack=%d",
+                     s_active_config.broker_uri,
+                     event->error_handle->error_type,
+                     event->error_handle->esp_tls_last_esp_err,
+                     event->error_handle->esp_tls_stack_err,
+                     event->error_handle->esp_tls_cert_verify_flags,
+                     event->error_handle->esp_transport_sock_errno,
+                     event->error_handle->connect_return_code);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "MQTT 错误: broker=%s（无错误详情）", s_active_config.broker_uri);
+        }
         mqtt_set_state(MQTT_STATE_ERROR);
         break;
 
@@ -116,18 +172,45 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
-// 初始化
-esp_err_t mqtt_manager_init(void)
+// 比较两份 MQTT 配置是否一致
+static bool mqtt_config_equal(const mqtt_config_t *a, const mqtt_config_t *b)
 {
+    return strcmp(a->broker_uri, b->broker_uri) == 0 &&
+           strcmp(a->client_id, b->client_id) == 0 &&
+           strcmp(a->username, b->username) == 0 &&
+           strcmp(a->password, b->password) == 0 &&
+           strcmp(a->will_topic, b->will_topic) == 0 &&
+           a->is_provisioned == b->is_provisioned;
+}
+
+// 使用指定配置初始化
+esp_err_t mqtt_manager_init_with_config(const mqtt_config_t *config)
+{
+    if (config == NULL || config->broker_uri[0] == '\0')
+    {
+        ESP_LOGE(TAG, "MQTT 配置无效");
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if (mqtt_client != NULL)
     {
         return ESP_OK;
     }
+
     esp_log_level_set("mqtt_client", ESP_LOG_NONE);
-    // 从 NVS 加载配置
-    mqtt_config_t config;
-    mqtt_config_load(&config);
-    s_is_provisioned = config.is_provisioned;
+
+    // 保存一份副本，确保字符串生命周期覆盖 MQTT 客户端运行期
+    s_active_config = *config;
+    s_is_provisioned = s_active_config.is_provisioned;
+
+    ESP_LOGI(TAG, "MQTT 目标服务器: %s", s_active_config.broker_uri);
+    ESP_LOGI(TAG, "MQTT 连接参数: client_id=%s, username=%s, password=%s, "
+                  "keepalive=%ds, timeout=%dms, provisioned=%d",
+             s_active_config.client_id,
+             s_active_config.username[0] ? s_active_config.username : "(空)",
+             s_active_config.password[0] ? "******" : "(空)",
+             MQTT_KEEPALIVE_SEC, MQTT_CONN_TIMEOUT_MS, s_is_provisioned);
+
     mqtt_topic_init();
     will_message = mqtt_message_create_will();
     if (will_message == NULL)
@@ -137,18 +220,18 @@ esp_err_t mqtt_manager_init(void)
 
     esp_mqtt_client_config_t mqtt_cfg =
         {
-            .broker.address.uri = config.broker_uri, // ← 动态
+            .broker.address.uri = s_active_config.broker_uri,
             .credentials =
                 {
-                    .client_id = config.client_id,              // ← 动态
-                    .username = config.username,                // ← 动态
-                    .authentication.password = config.password, // ← 动态
+                    .client_id = s_active_config.client_id,
+                    .username = s_active_config.username,
+                    .authentication.password = s_active_config.password,
                 },
             .session =
                 {
                     .last_will =
                         {
-                            .topic = config.will_topic, // ← 动态
+                            .topic = s_active_config.will_topic,
                             .msg = will_message,
                             .msg_len = strlen(will_message),
                             .qos = WILL_QOS,
@@ -174,6 +257,41 @@ esp_err_t mqtt_manager_init(void)
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     mqtt_set_state(MQTT_STATE_INIT);
     return ESP_OK;
+}
+
+// 初始化：从 NVS 加载配置（NVS 缺失时使用默认值）
+esp_err_t mqtt_manager_init(void)
+{
+    mqtt_config_t config;
+    esp_err_t ret = mqtt_config_load(&config);
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
+    return mqtt_manager_init_with_config(&config);
+}
+
+// 应用新配置：配置相同则复用客户端，不同则重建
+esp_err_t mqtt_manager_reconfigure(const mqtt_config_t *config)
+{
+    if (config == NULL || config->broker_uri[0] == '\0')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (mqtt_client != NULL)
+    {
+        if (mqtt_config_equal(&s_active_config, config))
+        {
+            s_is_provisioned = config->is_provisioned;
+            return ESP_OK;
+        }
+
+        ESP_LOGI(TAG, "MQTT 配置已变化，重建客户端");
+        mqtt_manager_destroy();
+    }
+
+    return mqtt_manager_init_with_config(config);
 }
 
 // 启动

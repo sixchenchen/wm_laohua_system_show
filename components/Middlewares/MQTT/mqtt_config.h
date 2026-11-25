@@ -70,9 +70,15 @@ typedef struct
 } mqtt_config_t;
 
 /*
-    加载 MQTT 配置
+    加载 MQTT 配置（NVS 缺失时自动填充默认值）
  */
 esp_err_t mqtt_config_load(mqtt_config_t *config);
+
+/*
+    仅加载 NVS 中已保存的配置
+    返回 ESP_ERR_NOT_FOUND 表示 NVS 中没有 broker_uri
+ */
+esp_err_t mqtt_config_load_stored(mqtt_config_t *config);
 
 /*
     保存 MQTT 配置到 NVS

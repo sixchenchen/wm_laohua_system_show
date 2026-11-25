@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -16,9 +17,12 @@
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "mqtt_config.h"
-#include "mqtt_provision.h"
 
 static const char *TAG = "wifi_manager";
+
+// NVS 配置连接失败后，回退到默认配置的等待时间
+#define MQTT_FALLBACK_TIMEOUT_MS 12000
+#define MQTT_FALLBACK_POLL_MS 500
 bool mqtt_ready_for_mode_switch = false;
 static bool wifi_init_flag = false;
 static bool wifi_connected = false;
@@ -31,6 +35,8 @@ static uint32_t current_retry_delay_ms = MIN_RETRY_DELAY_MS; // 当前重试延�
 static esp_timer_handle_t reconnect_timer = NULL;
 static wifi_manager_state_t wifi_state = WIFI_MANAGER_IDLE;
 static TaskHandle_t delayed_switch_task_handle = NULL;
+static uint32_t mqtt_config_generation = 0;
+static bool using_default_mqtt_config = false;
 
 // 函数声明
 static uint32_t wifi_reconnect_calc_delay(void);
@@ -38,6 +44,8 @@ static void wifi_reconnect_reset(void);
 static void wifi_manager_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static void wifi_manager_handle_disconnect(wifi_event_sta_disconnected_t *reason);
 static void wifi_manager_handle_connected(void);
+static void mqtt_connect_task(void *arg);
+static void mqtt_fallback_task(void *arg);
 static void delayed_switch_to_sta_task(void *arg);
 static void wifi_reconnect_timer_cb(void *arg);
 
@@ -196,19 +204,17 @@ static void wifi_manager_handle_connected(void)
     memset(g_connecting_ssid, 0, sizeof(g_connecting_ssid));
     memset(g_connecting_password, 0, sizeof(g_connecting_password));
     mqtt_ready_for_mode_switch = false;
-    // MQTT启动
-    mqtt_service_init();
-    if (mqtt_config_is_provisioned())
+    mqtt_config_generation++;
+    using_default_mqtt_config = false;
+
+    // MQTT 初始化放到独立任务，避免在 WiFi 事件任务中占用过多栈
+    if (xTaskCreate(mqtt_connect_task, "mqtt_connect", 8192,
+                    (void *)(uintptr_t)mqtt_config_generation, 5,
+                    NULL) != pdPASS)
     {
-        ESP_LOGI(TAG, "already provisioned, connect to production broker");
-        mqtt_manager_on_wifi_connected();
+        ESP_LOGE(TAG, "failed to create MQTT connect task");
     }
-    else
-    {
-        ESP_LOGI(TAG, "not provisioned, starting provision");
-        mqtt_manager_on_wifi_connected();
-        mqtt_provision_start();
-    }
+
     // 创建连接成功延时4s
     xTaskCreate(delayed_switch_to_sta_task, "delay_sta", 2048, NULL, 5, &delayed_switch_task_handle);
 }
@@ -223,6 +229,7 @@ static void wifi_manager_handle_disconnect(wifi_event_sta_disconnected_t *reason
     }
 
     wifi_connected = false;
+    mqtt_config_generation++;
     mqtt_manager_on_wifi_disconnected();
     ESP_LOGW(TAG, "disconnect reason=%d", reason->reason);
 
@@ -242,6 +249,100 @@ static void wifi_manager_handle_disconnect(wifi_event_sta_disconnected_t *reason
     }
 
     wifi_reconnect_schedule();
+}
+
+// 独立任务中初始化并启动 MQTT，避免 WiFi 事件任务栈溢出
+static void mqtt_connect_task(void *arg)
+{
+    uint32_t generation = (uint32_t)(uintptr_t)arg;
+
+    if (generation != mqtt_config_generation || !wifi_connected)
+    {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    mqtt_config_t config;
+    bool use_default = false;
+
+    if (mqtt_config_load_stored(&config) == ESP_OK)
+    {
+        ESP_LOGI(TAG, "using stored MQTT config: broker=%s, provisioned=%d",
+                 config.broker_uri, config.is_provisioned);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "no stored MQTT config, using default registration broker");
+        mqtt_config_get_default(&config);
+        using_default_mqtt_config = true;
+        use_default = true;
+    }
+
+    mqtt_service_init_with_config(&config);
+    mqtt_manager_on_wifi_connected();
+
+    if (!use_default)
+    {
+        if (xTaskCreate(mqtt_fallback_task, "mqtt_fallback", 8192,
+                        (void *)(uintptr_t)generation, 5,
+                        NULL) != pdPASS)
+        {
+            ESP_LOGE(TAG, "failed to create MQTT fallback task");
+        }
+    }
+
+    vTaskDelete(NULL);
+}
+
+// NVS 配置连接失败后回退到默认配置
+static void mqtt_fallback_task(void *arg)
+{
+    uint32_t generation = (uint32_t)(uintptr_t)arg;
+    int waited_ms = 0;
+
+    while (waited_ms < MQTT_FALLBACK_TIMEOUT_MS)
+    {
+        vTaskDelay(pdMS_TO_TICKS(MQTT_FALLBACK_POLL_MS));
+        waited_ms += MQTT_FALLBACK_POLL_MS;
+
+        if (generation != mqtt_config_generation || !wifi_connected)
+        {
+            vTaskDelete(NULL);
+            return;
+        }
+
+        // NVS 配置只要成功连接过，就认为配置有效，不触发回退
+        if (mqtt_ready_for_mode_switch)
+        {
+            ESP_LOGI(TAG, "MQTT connected with stored config, no fallback");
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+
+    if (generation != mqtt_config_generation || !wifi_connected ||
+        mqtt_ready_for_mode_switch || using_default_mqtt_config)
+    {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGW(TAG, "stored MQTT config connect timeout, fallback to default config");
+
+    using_default_mqtt_config = true;
+    ESP_LOGW(TAG, "fallback: destroying old MQTT client");
+    mqtt_manager_destroy();
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    mqtt_config_t default_config;
+    mqtt_config_get_default(&default_config);
+    ESP_LOGW(TAG, "fallback broker: %s", default_config.broker_uri);
+    ESP_LOGW(TAG, "fallback: initializing default MQTT client");
+    mqtt_service_init_with_config(&default_config);
+    ESP_LOGW(TAG, "fallback: starting MQTT client");
+    mqtt_manager_on_wifi_connected();
+
+    vTaskDelete(NULL);
 }
 
 // 迟切换 STA 任务，给前端留 4 秒时间
